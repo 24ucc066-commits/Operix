@@ -667,7 +667,7 @@ with fc3:
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
     st.markdown('<div class="btn-blu">', unsafe_allow_html=True)
     if st.button("📈  View Improvements", key="fc_imp", use_container_width=True):
-        st.switch_page("pages/app1.py")
+        st.switch_page("pages/improvement.py")
     st.markdown("</div>", unsafe_allow_html=True)
 
 
