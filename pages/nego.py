@@ -1,889 +1,770 @@
 import streamlit as st
-import requests
-import json
-import os
+from langchain_groq import ChatGroq
+from dotenv import load_dotenv
+import os, json, csv, io, time
+from difflib import SequenceMatcher
 
-st.set_page_config(layout="wide", page_title="NegotiatorAI")
+load_dotenv()
 
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-MODEL = "llama-3.3-70b-versatile"
+st.set_page_config(layout="wide", page_title="VendorIQ — Procurement Intelligence")
 
-# ── Read API key from environment ────────────────────────────────────────────
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+# ── LLM ──────────────────────────────────────────────────────────────────────
+@st.cache_resource
+def get_llm():
+    return ChatGroq(model="llama-3.1-8b-instant", api_key=os.getenv("GROQ_API_KEY"))
 
-# ── Session state init ────────────────────────────────────────────────────────
-for k in ["step","result","deals","handle_reply_id","handle_reply_result","error"]:
-    if k not in st.session_state:
-        st.session_state[k] = None
-if "deals" not in st.session_state or st.session_state.deals is None:
-    st.session_state.deals = []
-if "step" not in st.session_state or st.session_state.step is None:
-    st.session_state.step = 1
+# ── SIMILARITY HELPERS ────────────────────────────────────────────────────────
 
-def call_groq(messages):
-    resp = requests.post(
-        GROQ_URL,
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {GROQ_API_KEY}"},
-        json={"model": MODEL, "temperature": 0.65, "max_tokens": 1800, "messages": messages},
-        timeout=60
-    )
-    data = resp.json()
-    if "error" in data:
-        raise Exception(data["error"].get("message", "Groq API error"))
-    return data["choices"][0]["message"]["content"]
+def name_similarity(a, b):
+    a, b = a.lower().strip(), b.lower().strip()
+    if a == b: return 1.0
+    for suffix in [" ltd"," inc"," pvt"," llc"," corp"," co"," limited"," private","."]:
+        a = a.replace(suffix, ""); b = b.replace(suffix, "")
+    a, b = a.strip(), b.strip()
+    if a == b: return 0.97
+    return SequenceMatcher(None, a, b).ratio()
 
-def parse_json(text):
-    text = text.replace("```json","").replace("```","").strip()
+def service_similarity(a, b):
+    if not a or not b: return 0.0
+    a, b = a.lower().strip(), b.lower().strip()
+    if a == b: return 1.0
+    wa, wb = set(a.split()), set(b.split())
+    if not wa or not wb: return 0.0
+    return max(len(wa & wb) / len(wa | wb), SequenceMatcher(None, a, b).ratio())
+
+def is_duplicate(v1, v2):
+    ns = name_similarity(v1.get("name",""), v2.get("name",""))
+    ss = service_similarity(v1.get("service",""), v2.get("service",""))
+    if ns >= 0.97: return True, ns, ss, "exact_name"
+    if ns >= 0.72 and ss >= 0.55: return True, ns, ss, "name_and_service"
+    if ss >= 0.9 and ns >= 0.55: return True, ns, ss, "same_service"
+    return False, ns, ss, None
+
+def is_low_value(vendor):
+    score = 0; reasons = []
+    spend  = float(vendor.get("annual_spend", 0) or 0)
+    txn    = int(vendor.get("transactions", 0) or 0)
+    rating = float(vendor.get("rating", 3) or 3)
+    cat    = vendor.get("service","").lower()
+    if spend < 10000:   score += 3; reasons.append("Very low annual spend")
+    elif spend < 50000: score += 1; reasons.append("Low annual spend")
+    if txn < 3:    score += 3; reasons.append("Fewer than 3 transactions")
+    elif txn < 10: score += 1; reasons.append("Low transaction count")
+    if rating < 2.5:   score += 3; reasons.append("Poor performance rating")
+    elif rating < 3.5: score += 1; reasons.append("Below-average rating")
+    risky = ["misc","miscellaneous","one-time","temp","trial","test","unknown","other"]
+    if any(k in cat for k in risky): score += 2; reasons.append("High-risk category")
+    return score >= 4, score, reasons
+
+def parse_vendors(data_str):
     try:
-        return json.loads(text)
-    except:
-        import re
-        m = re.search(r'\{[\s\S]*\}', text)
-        if m:
-            try: return json.loads(m.group(0))
-            except: pass
-    return None
-
-def fmt_pct(quoted, target):
-    try:
-        import re
-        q = float(re.sub(r'[^0-9.]','',quoted))
-        t = float(re.sub(r'[^0-9.]','',target))
-        if q > 0: return f"{round((q-t)/q*100)}%"
+        reader = csv.DictReader(io.StringIO(data_str.strip()))
+        vendors = [dict(r) for r in reader]
+        if vendors and any(k.strip() for k in vendors[0]): return vendors
     except: pass
-    return ""
+    try: return json.loads(data_str)
+    except: pass
+    return []
 
-# ── Global CSS ────────────────────────────────────────────────────────────────
+def generate_sample_vendors():
+    return [
+        {"id":"V001","name":"Infosys Ltd","service":"IT Consulting","annual_spend":850000,"transactions":42,"rating":4.2,"location":"Bangalore","contact":"infosys@corp.com"},
+        {"id":"V002","name":"Infosys Limited","service":"IT Consulting","annual_spend":120000,"transactions":8,"rating":3.9,"location":"Mumbai","contact":"infosys.ltd@vendor.com"},
+        {"id":"V003","name":"TCS","service":"Software Development","annual_spend":1200000,"transactions":67,"rating":4.5,"location":"Mumbai","contact":"tcs@corp.com"},
+        {"id":"V004","name":"Tata Consultancy Services","service":"Software Development","annual_spend":95000,"transactions":5,"rating":4.0,"location":"Pune","contact":"tcs.vendor@email.com"},
+        {"id":"V005","name":"Wipro","service":"Cloud Services","annual_spend":430000,"transactions":28,"rating":3.8,"location":"Bangalore","contact":"wipro@corp.com"},
+        {"id":"V006","name":"Wipro Technologies","service":"Cloud Services","annual_spend":67000,"transactions":4,"rating":3.5,"location":"Hyderabad","contact":"wipro.tech@vendor.com"},
+        {"id":"V007","name":"Amazon Web Services","service":"Cloud Hosting","annual_spend":920000,"transactions":365,"rating":4.7,"location":"USA","contact":"aws@corp.com"},
+        {"id":"V008","name":"AWS","service":"Cloud Hosting","annual_spend":15000,"transactions":2,"rating":4.6,"location":"USA","contact":"aws.billing@company.com"},
+        {"id":"V009","name":"Quick Stationary","service":"Office Supplies","annual_spend":4200,"transactions":2,"rating":2.1,"location":"Delhi","contact":"qs@gmail.com"},
+        {"id":"V010","name":"Misc Vendor A","service":"Miscellaneous","annual_spend":1800,"transactions":1,"rating":2.0,"location":"Unknown","contact":"misc@temp.com"},
+        {"id":"V011","name":"Cognizant","service":"IT Consulting","annual_spend":540000,"transactions":31,"rating":4.1,"location":"Chennai","contact":"cognizant@corp.com"},
+        {"id":"V012","name":"HCL Technologies","service":"IT Services","annual_spend":380000,"transactions":24,"rating":4.0,"location":"Noida","contact":"hcl@corp.com"},
+        {"id":"V013","name":"HCL Tech","service":"IT Services","annual_spend":88000,"transactions":6,"rating":3.7,"location":"Gurgaon","contact":"hcltech@vendor.com"},
+        {"id":"V014","name":"Reliance Jio","service":"Telecom","annual_spend":240000,"transactions":12,"rating":3.9,"location":"Mumbai","contact":"jio@corp.com"},
+        {"id":"V015","name":"One-Time Printer Repair","service":"One-Time","annual_spend":3500,"transactions":1,"rating":3.0,"location":"Delhi","contact":"printer@temp.com"},
+        {"id":"V016","name":"Microsoft","service":"Software Licensing","annual_spend":760000,"transactions":12,"rating":4.6,"location":"USA","contact":"msft@corp.com"},
+        {"id":"V017","name":"Microsoft Corp","service":"Software Licensing","annual_spend":45000,"transactions":3,"rating":4.4,"location":"USA","contact":"microsoft.vendor@email.com"},
+        {"id":"V018","name":"Zomato Business","service":"Food Catering","annual_spend":180000,"transactions":48,"rating":4.0,"location":"Bangalore","contact":"zomato@corp.com"},
+        {"id":"V019","name":"TestVendor XYZ","service":"Test Services","annual_spend":500,"transactions":1,"rating":1.5,"location":"Unknown","contact":"test@test.com"},
+        {"id":"V020","name":"Oracle","service":"Database Software","annual_spend":920000,"transactions":4,"rating":4.3,"location":"USA","contact":"oracle@corp.com"},
+    ]
+
+# ── AGENT TOOLS ───────────────────────────────────────────────────────────────
+
+def tool_parse_dataset(vendors):
+    total_spend = sum(float(v.get("annual_spend",0) or 0) for v in vendors)
+    services = list(set(v.get("service","") for v in vendors if v.get("service")))
+    return {
+        "total_vendors": len(vendors),
+        "total_spend": int(total_spend),
+        "unique_services": len(services),
+        "top_services": services[:5],
+        "avg_spend": int(total_spend / len(vendors)) if vendors else 0
+    }
+
+def tool_find_duplicates(vendors):
+    duplicates = []
+    seen = set()
+    for i in range(len(vendors)):
+        for j in range(i+1, len(vendors)):
+            if (i,j) in seen: continue
+            dup, ns, ss, reason = is_duplicate(vendors[i], vendors[j])
+            if dup:
+                seen.add((i,j))
+                s1 = float(vendors[i].get("annual_spend",0) or 0)
+                s2 = float(vendors[j].get("annual_spend",0) or 0)
+                primary   = vendors[i] if s1 >= s2 else vendors[j]
+                secondary = vendors[j] if s1 >= s2 else vendors[i]
+                savings = min(s1,s2) * 0.85
+                duplicates.append({
+                    "primary": primary, "secondary": secondary,
+                    "name_similarity": round(ns*100), "service_similarity": round(ss*100),
+                    "reason": reason, "potential_savings": round(savings),
+                    "priority": "HIGH" if savings>50000 else "MEDIUM" if savings>10000 else "LOW"
+                })
+    duplicates.sort(key=lambda x: x["potential_savings"], reverse=True)
+    return duplicates
+
+def tool_flag_low_value(vendors, dup_secondaries):
+    dup_ids = {v.get("id") for v in dup_secondaries}
+    low_value = []
+    for v in vendors:
+        if v.get("id") in dup_ids: continue
+        flagged, score, reasons = is_low_value(v)
+        if flagged:
+            spend = float(v.get("annual_spend",0) or 0)
+            low_value.append({
+                "vendor": v, "score": score, "reasons": reasons,
+                "potential_savings": round(spend*0.9),
+                "recommendation": "TERMINATE" if score>=6 else "REVIEW"
+            })
+    low_value.sort(key=lambda x: x["score"], reverse=True)
+    return low_value
+
+def tool_build_action_plan(duplicates, low_value, vendors):
+    total_spend   = sum(float(v.get("annual_spend",0) or 0) for v in vendors)
+    dup_savings   = sum(d["potential_savings"] for d in duplicates)
+    lv_savings    = sum(l["potential_savings"] for l in low_value)
+    total_savings = dup_savings + lv_savings
+    actions = []
+    rank = 1
+    for d in duplicates[:6]:
+        actions.append({
+            "rank": rank, "type": "CONSOLIDATE",
+            "action": "Consolidate " + d["secondary"].get("name","") + " into " + d["primary"].get("name",""),
+            "savings": d["potential_savings"], "priority": d["priority"],
+            "effort": "LOW", "timeline": "30 days"
+        })
+        rank += 1
+    for l in low_value[:5]:
+        v = l["vendor"]
+        actions.append({
+            "rank": rank, "type": l["recommendation"],
+            "action": l["recommendation"] + " vendor: " + v.get("name","") + " — " + "; ".join(l["reasons"][:2]),
+            "savings": l["potential_savings"], "priority": "HIGH" if l["score"]>=6 else "MEDIUM",
+            "effort": "MEDIUM", "timeline": "60 days"
+        })
+        rank += 1
+    actions.sort(key=lambda x: x["savings"], reverse=True)
+    for i,a in enumerate(actions): a["rank"] = i+1
+    return {
+        "total_vendors": len(vendors), "total_spend": int(total_spend),
+        "duplicate_pairs": len(duplicates), "low_value_vendors": len(low_value),
+        "potential_savings": int(total_savings),
+        "savings_percent": round((total_savings/total_spend*100) if total_spend else 0,1),
+        "action_plan": actions, "executive_summary": ""
+    }
+
+def tool_generate_summary(report, duplicates, low_value):
+    llm = get_llm()
+    prompt = (
+        "You are a procurement intelligence expert.\n"
+        "Findings: " + str(report["total_vendors"]) + " vendors analyzed, "
+        + str(report["duplicate_pairs"]) + " duplicate pairs found, "
+        + str(report["low_value_vendors"]) + " low-value vendors flagged.\n"
+        "Total spend: Rs." + str(report["total_spend"]) + "\n"
+        "Potential savings: Rs." + str(report["potential_savings"]) + " (" + str(report["savings_percent"]) + "%)\n"
+        "Top duplicate pairs: " + ", ".join([d["primary"].get("name","") + " vs " + d["secondary"].get("name","") for d in duplicates[:3]]) + "\n"
+        "Write a sharp 2-sentence executive summary. Be specific with numbers. No preamble."
+    )
+    try:
+        return llm.invoke(prompt).content.strip()
+    except:
+        return ("Identified " + str(report["duplicate_pairs"]) + " duplicate vendor pairs and "
+            + str(report["low_value_vendors"]) + " low-value vendors across a Rs."
+            + str(report["total_spend"]) + " procurement base. "
+            "Immediate consolidation and termination actions can recover Rs."
+            + str(report["potential_savings"]) + " (" + str(report["savings_percent"]) + "% of spend).")
+
+# ── AGENTIC PIPELINE (with Streamlit live log) ────────────────────────────────
+
+def run_agent(vendors, log_placeholder, progress_bar):
+    logs = []
+
+    def push(icon, label, text):
+        logs.append((icon, label, text))
+        render_log(log_placeholder, logs)
+
+    def render_log(placeholder, entries):
+        html = ""
+        for ic, lb, tx in entries:
+            html += f"""
+            <div style="display:flex;gap:10px;align-items:flex-start;padding:6px 0;
+                        border-bottom:1px solid rgba(255,255,255,.04);animation:none">
+              <span style="font-family:monospace;font-size:10px;padding:2px 6px;border-radius:2px;
+                           flex-shrink:0;letter-spacing:1px;{ic['style']}">{lb}</span>
+              <span style="font-family:monospace;font-size:12px;color:#6a8aaa;line-height:1.6">{tx}</span>
+            </div>"""
+        placeholder.markdown(
+            f"""<div style="background:#04080f;border:1px solid #162540;border-radius:6px;
+                            padding:16px;max-height:340px;overflow-y:auto">{html}</div>""",
+            unsafe_allow_html=True)
+
+    think_style = "background:rgba(0,212,255,.1);color:#00d4ff;border:1px solid rgba(0,212,255,.2)"
+    tool_style  = "background:rgba(245,166,35,.1);color:#f5a623;border:1px solid rgba(245,166,35,.2)"
+    obs_style   = "background:rgba(0,224,144,.1);color:#00e090;border:1px solid rgba(0,224,144,.2)"
+    act_style   = "background:rgba(255,64,96,.1);color:#ff4060;border:1px solid rgba(255,64,96,.2)"
+    done_style  = "background:rgba(0,224,144,.15);color:#00e090;border:1px solid rgba(0,224,144,.3)"
+
+    # STEP 1
+    push({"style":think_style}, "THINK", f"Received {len(vendors)} vendors. Planning analysis strategy...")
+    progress_bar.progress(8)
+    time.sleep(0.3)
+
+    # STEP 2
+    push({"style":tool_style}, "TOOL", "parse_dataset — Scanning dataset structure, spend distribution, and service taxonomy")
+    progress_bar.progress(15)
+    time.sleep(0.4)
+    stats = tool_parse_dataset(vendors)
+    push({"style":obs_style}, "OBS", f"Total spend Rs.{stats['total_spend']:,} across {stats['unique_services']} service categories. Avg vendor spend: Rs.{stats['avg_spend']:,}")
+    progress_bar.progress(20)
+    time.sleep(0.2)
+
+    # STEP 3
+    push({"style":think_style}, "THINK", "High vendor count relative to service categories suggests consolidation opportunity. Running pairwise similarity engine...")
+    progress_bar.progress(25)
+    time.sleep(0.4)
+
+    # STEP 4
+    n_pairs = len(vendors)*(len(vendors)-1)//2
+    push({"style":tool_style}, "TOOL", f"find_duplicates — Running name similarity (SequenceMatcher) + service overlap scoring on all {n_pairs} vendor pairs")
+    progress_bar.progress(35)
+    time.sleep(0.5)
+    duplicates = tool_find_duplicates(vendors)
+    high_prio  = sum(1 for d in duplicates if d["priority"]=="HIGH")
+    dup_savings = sum(d["potential_savings"] for d in duplicates)
+    push({"style":obs_style}, "OBS", f"Found {len(duplicates)} duplicate pairs ({high_prio} HIGH priority). Recoverable spend: Rs.{dup_savings:,}")
+    progress_bar.progress(50)
+    time.sleep(0.3)
+
+    # STEP 5
+    if duplicates:
+        top = duplicates[0]
+        push({"style":think_style}, "THINK",
+             f"Highest impact duplicate: {top['secondary'].get('name','')} vs {top['primary'].get('name','')} — "
+             f"{top['name_similarity']}% name match, Rs.{top['potential_savings']:,} recoverable. Proceeding to low-value scan...")
+    else:
+        push({"style":think_style}, "THINK", "No duplicates found. Proceeding to low-value vendor scan...")
+    progress_bar.progress(55)
+    time.sleep(0.4)
+
+    # STEP 6
+    secondary_vendors = [d["secondary"] for d in duplicates]
+    push({"style":tool_style}, "TOOL", "flag_low_value — Scoring vendors on spend, transaction frequency, performance rating, and category risk")
+    progress_bar.progress(65)
+    time.sleep(0.5)
+    low_value = tool_flag_low_value(vendors, secondary_vendors)
+    terminate = sum(1 for l in low_value if l["recommendation"]=="TERMINATE")
+    review    = sum(1 for l in low_value if l["recommendation"]=="REVIEW")
+    lv_savings = sum(l["potential_savings"] for l in low_value)
+    push({"style":obs_style}, "OBS", f"Flagged {len(low_value)} low-value vendors: {terminate} TERMINATE, {review} REVIEW. Recoverable: Rs.{lv_savings:,}")
+    progress_bar.progress(72)
+    time.sleep(0.3)
+
+    # STEP 7
+    push({"style":tool_style}, "TOOL", "build_action_plan — Ranking all actions by savings potential and implementation effort")
+    progress_bar.progress(80)
+    time.sleep(0.4)
+    report = tool_build_action_plan(duplicates, low_value, vendors)
+
+    # STEP 8
+    push({"style":tool_style}, "TOOL", "generate_executive_summary — Invoking LLM to synthesize findings into executive summary")
+    progress_bar.progress(88)
+    time.sleep(0.3)
+    report["executive_summary"] = tool_generate_summary(report, duplicates, low_value)
+    push({"style":obs_style}, "OBS",
+         f"Executive summary generated. Total optimization potential: Rs.{report['potential_savings']:,} ({report['savings_percent']}% of spend)")
+    progress_bar.progress(94)
+    time.sleep(0.3)
+
+    # STEP 9
+    if report["action_plan"]:
+        top_a = report["action_plan"][0]
+        push({"style":act_style}, "ACT",
+             f"Top autonomous recommendation: {top_a['action']} [{top_a['priority']} PRIORITY, Rs.{top_a['savings']:,} savings]")
+        progress_bar.progress(97)
+        time.sleep(0.4)
+
+    push({"style":done_style}, "DONE", f"{len(report['action_plan'])} actions ready. Agent handing off to dashboard.")
+    progress_bar.progress(100)
+
+    return {"report": report, "duplicates": duplicates, "low_value": low_value, "vendors": vendors}
+
+# ── STREAMLIT UI ──────────────────────────────────────────────────────────────
+
+# Inject custom CSS matching original dark theme
 st.markdown("""
 <style>
-:root {
-  --bg: #0d0f14;
-  --sf: #13161d;
-  --card: #181c26;
-  --b1: #1e2330;
-  --b2: #252c3d;
-  --tx: #e4e9f4;
-  --mu: #5a6480;
-  --blue: #4f9cf9;
-  --green: #00e096;
-  --red: #ff4f5e;
-  --yellow: #f5c542;
+@import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500&display=swap');
+
+html, body, [class*="css"] {
+    background-color: #04080f !important;
+    color: #e0eaf8 !important;
+    font-family: 'DM Sans', sans-serif !important;
+}
+.stApp { background-color: #04080f !important; }
+.block-container { padding-top: 2rem !important; max-width: 1100px !important; }
+
+/* hide default streamlit elements */
+#MainMenu, footer, header { visibility: hidden; }
+
+/* metric cards */
+[data-testid="metric-container"] {
+    background: #080f1a !important;
+    border: 1px solid #162540 !important;
+    border-radius: 6px !important;
+    padding: 16px !important;
+}
+[data-testid="metric-container"] label {
+    font-family: 'DM Mono', monospace !important;
+    font-size: 10px !important;
+    letter-spacing: 2px !important;
+    text-transform: uppercase !important;
+    color: #6a8aaa !important;
+}
+[data-testid="metric-container"] [data-testid="metric-value"] {
+    font-family: 'Bebas Neue', sans-serif !important;
+    font-size: 32px !important;
+    color: #00d4ff !important;
 }
 
-html, body, .stApp,
-[data-testid="stAppViewContainer"],
-[data-testid="stMain"] {
-  background: var(--bg) !important;
-  color: var(--tx) !important;
-  font-family: Arial, sans-serif !important;
-}
-
-header[data-testid="stHeader"],
-footer,
-[data-testid="stToolbar"],
-[data-testid="stDecoration"] {
-  display: none !important;
-}
-
-.block-container {
-  padding: 0 !important;
-  max-width: 100% !important;
-}
-
-/* ── Navbar ── */
-.on-nav {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 14px 32px;
-  border-bottom: 1px solid var(--b1);
-  background: var(--bg);
-}
-.on-logo-wrap { display: flex; align-items: center; gap: 12px; }
-.on-logo {
-  width: 36px; height: 36px; border-radius: 10px;
-  background: linear-gradient(135deg,#4f9cf9,#a855f7);
-  display: flex; align-items: center; justify-content: center; font-size: 18px;
-}
-.on-brand { font-size: 18px; font-weight: 700; }
-.on-badge {
-  padding: 3px 10px; border: 1px solid var(--b2); border-radius: 20px;
-  font-size: 9px; color: var(--mu); font-weight: 600;
-  letter-spacing: 1.5px; text-transform: uppercase; font-family: 'Courier New', monospace;
-}
-
-/* ── Hero ── */
-.hero-label {
-  font-size: 9px; font-weight: 600; letter-spacing: 2px;
-  text-transform: uppercase; color: var(--mu); margin-bottom: 10px;
-  font-family: 'Courier New', monospace;
-}
-.hero-h1 { font-size: 36px; font-weight: 700; line-height: 1.1; margin-bottom: 14px; }
-.c-white { color: var(--tx); }
-.c-blue { color: var(--blue); }
-.c-green { color: var(--green); }
-.feat-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 20px; }
-.feat-tag {
-  border: 1px solid var(--b2); padding: 3px 8px; border-radius: 4px;
-  font-size: 10px; color: var(--mu); display: inline-block;
-}
-
-/* ── Step bar ── */
-.steps-bar {
-  display: flex; gap: 6px; margin-bottom: 20px;
-}
-.step-tab {
-  flex: 1; display: flex; flex-direction: column; align-items: center;
-  gap: 3px; padding: 10px 4px 8px; border-radius: 8px;
-  border: 1px solid var(--b1); background: var(--sf);
-}
-.step-tab.active { border-color: var(--blue); background: rgba(79,156,249,0.06); }
-.step-tab.done  { border-color: rgba(0,224,150,0.3); background: rgba(0,224,150,0.04); }
-.st-num {
-  font-size: 9px; font-weight: 700; color: var(--mu);
-  font-family: 'Courier New', monospace; letter-spacing: 1px;
-}
-.step-tab.active .st-num { color: var(--blue); }
-.step-tab.done  .st-num  { color: var(--green); }
-.st-ico  { font-size: 14px; }
-.st-label {
-  font-size: 9px; font-weight: 600; color: var(--mu);
-  letter-spacing: 0.5px; text-transform: uppercase;
-}
-.step-tab.active .st-label { color: var(--blue); }
-.step-tab.done  .st-label  { color: var(--green); }
-
-/* ── Section rule ── */
-.srule { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; }
-.srule-title {
-  font-size: 9px; font-weight: 700; letter-spacing: 2px;
-  text-transform: uppercase; color: var(--mu); white-space: nowrap;
-  font-family: 'Courier New', monospace;
-}
-.srule-line { flex: 1; height: 1px; background: var(--b1); }
-
-/* ── Tip box ── */
-.tip-box {
-  display: flex; align-items: flex-start; gap: 8px;
-  background: rgba(79,156,249,0.06); border: 1px solid rgba(79,156,249,0.18);
-  border-radius: 8px; padding: 12px 14px; font-size: 12px;
-  color: var(--mu); line-height: 1.6; margin-bottom: 16px;
-}
-
-/* ── Cards ── */
-.kpi-card, .result-card, .deal-card {
-  background: var(--sf); border: 1px solid var(--b1);
-  border-radius: 10px; padding: 16px; margin-bottom: 12px;
-}
-.kpi-label {
-  font-size: 9px; font-weight: 600; letter-spacing: 1.5px;
-  text-transform: uppercase; color: var(--mu);
-  font-family: 'Courier New', monospace; margin-bottom: 6px;
-}
-.kpi-val {
-  font-size: 20px; font-weight: 700;
-  font-family: 'Courier New', monospace; letter-spacing: -1px;
-}
-
-/* ── Result cards ── */
-.result-card.rc-yellow { background: rgba(245,197,66,0.06); border: 1px solid rgba(245,197,66,0.2); }
-.result-card.rc-blue   { background: rgba(79,156,249,0.06);  border: 1px solid rgba(79,156,249,0.2); }
-.rc-header {
-  font-size: 9px; font-weight: 700; letter-spacing: 2px;
-  text-transform: uppercase; font-family: 'Courier New', monospace; margin-bottom: 6px;
-}
-.rc-content { font-size: 12px; color: var(--tx); line-height: 1.7; }
-
-/* ── Email preview ── */
-.email-preview {
-  background: var(--sf); border: 1px solid var(--b1);
-  border-radius: 10px; overflow: hidden; margin-bottom: 14px;
-}
-.ep-header {
-  border-bottom: 1px solid var(--b1); padding: 12px 16px;
-  display: flex; flex-direction: column; gap: 6px;
-}
-.ep-row { display: flex; align-items: baseline; gap: 10px; font-size: 11px; }
-.ep-k {
-  font-family: 'Courier New', monospace; font-size: 9px; font-weight: 700;
-  letter-spacing: 1px; text-transform: uppercase; color: var(--mu); min-width: 60px;
-}
-.ep-v { color: var(--tx); flex: 1; word-break: break-word; }
-.ep-body {
-  padding: 16px; font-size: 12px; line-height: 1.8;
-  color: var(--tx); white-space: pre-wrap; word-break: break-word;
-}
-
-/* ── Power meter ── */
-.power-track {
-  height: 4px; background: var(--b2); border-radius: 2px; overflow: hidden; margin-top: 4px;
-}
-.power-fill { height: 100%; border-radius: 2px; }
-
-/* ── Agent cards ── */
-.agent-card {
-  display: flex; align-items: center; gap: 12px;
-  padding: 12px 14px; border-radius: 10px;
-  border: 1px solid var(--b1); background: var(--sf);
-  margin-bottom: 8px; position: relative; overflow: hidden;
-}
-.agent-ico {
-  width: 36px; height: 36px; border-radius: 8px;
-  border: 1px solid var(--b2); display: flex;
-  align-items: center; justify-content: center;
-  font-size: 16px; flex-shrink: 0; background: var(--card);
-}
-.agent-info { flex: 1; min-width: 0; }
-.agent-name { font-size: 13px; font-weight: 600; color: var(--tx); }
-.agent-desc { font-size: 10px; color: var(--mu); margin-top: 2px; line-height: 1.4; }
-.agent-badge {
-  font-size: 8px; font-weight: 700; letter-spacing: 1.5px;
-  text-transform: uppercase; padding: 3px 8px; border-radius: 20px;
-  flex-shrink: 0;
-}
-.badge-active {
-  background: rgba(0,224,150,0.12);
-  border: 1px solid rgba(0,224,150,0.3);
-  color: var(--green);
-}
-
-/* ── Strategy items ── */
-.strat-item {
-  display: flex; align-items: center; gap: 10px;
-  padding: 10px 12px; border-radius: 8px;
-  border: 1px solid var(--b1); background: var(--sf);
-  margin-bottom: 6px; cursor: pointer;
-}
-.strat-item.selected { border-color: var(--blue); background: rgba(79,156,249,0.06); }
-
-/* ── Deal card ── */
-.deal-card { position: relative; padding-left: 18px; }
-.deal-top { display: flex; align-items: flex-start; gap: 10px; }
-.deal-vendor { font-size: 13px; font-weight: 700; color: var(--tx); margin-bottom: 2px; }
-.deal-product { font-size: 11px; color: var(--mu); }
-.deal-prices { text-align: right; margin-left: auto; }
-.dp-orig { font-size: 10px; color: var(--mu); text-decoration: line-through; }
-.dp-current { font-size: 14px; font-weight: 700; color: var(--green); font-family: 'Courier New', monospace; }
-.dp-save { font-size: 10px; color: var(--yellow); }
-.dc { display: inline-block; font-size: 9px; font-weight: 700; letter-spacing: 1px;
-      text-transform: uppercase; padding: 3px 8px; border-radius: 4px;
-      font-family: 'Courier New', monospace; margin-top: 6px; }
-.dc-sent { background: rgba(79,156,249,0.12); border: 1px solid rgba(79,156,249,0.3); color: var(--blue); }
-.dc-neg  { background: rgba(245,197,66,0.12); border: 1px solid rgba(245,197,66,0.3); color: var(--yellow); }
-.dc-done { background: rgba(0,224,150,0.12);  border: 1px solid rgba(0,224,150,0.3);  color: var(--green); }
-
-/* ── Stat strip ── */
-.stat-strip {
-  display: grid; grid-template-columns: repeat(3,1fr);
-  border: 1px solid var(--b1); border-radius: 10px;
-  overflow: hidden; margin-top: 20px;
-}
-.stat-cell { padding: 18px; text-align: center; }
-.stat-val { font-size: 28px; font-weight: 700; font-family: 'Courier New', monospace; letter-spacing: -2px; }
-.stat-lbl {
-  font-size: 9px; color: var(--mu); font-family: 'Courier New', monospace;
-  letter-spacing: 1px; text-transform: uppercase; margin-top: 4px;
-}
-
-/* ── How-it-works steps ── */
-.how-step {
-  display: flex; align-items: flex-start; gap: 12px;
-  padding: 14px 0; border-bottom: 1px solid var(--b1); position: relative;
-}
-.how-num {
-  width: 28px; height: 28px; border-radius: 50%;
-  background: var(--card); display: flex; align-items: center;
-  justify-content: center; font-size: 11px; font-weight: 700;
-  font-family: 'Courier New', monospace; flex-shrink: 0;
-}
-.how-title { font-size: 13px; font-weight: 600; color: var(--tx); margin-bottom: 3px; }
-.how-desc  { font-size: 11px; color: var(--mu); font-family: 'Courier New', monospace; line-height: 1.6; }
-
-/* ── Empty state ── */
-.empty-state { text-align: center; padding: 36px 20px; color: var(--mu); }
-.empty-state .ei { font-size: 32px; margin-bottom: 10px; }
-.empty-state h3 { font-size: 15px; color: var(--tx); margin: 0 0 6px; }
-.empty-state p  { font-size: 12px; margin: 0; }
-
-/* ── Ready badge ── */
-.ready-badge {
-  padding: 5px 12px; background: rgba(0,224,150,0.12);
-  border: 1px solid rgba(0,224,150,0.3); border-radius: 4px;
-  font-size: 9px; font-weight: 700; letter-spacing: 2px;
-  text-transform: uppercase; color: var(--green); font-family: 'Courier New', monospace;
-}
-
-/* ── Streamlit widget overrides ── */
-.stTextInput > div > div > input,
-.stTextArea > div > div > textarea,
-.stSelectbox > div > div {
-  background: var(--card) !important;
-  border: 1px solid var(--b2) !important;
-  border-radius: 8px !important;
-  color: var(--tx) !important;
-  font-size: 13px !important;
-}
-.stTextInput > div > div > input:focus,
-.stTextArea > div > div > textarea:focus {
-  border-color: var(--blue) !important;
-  box-shadow: none !important;
-}
-label { color: var(--mu) !important; font-size: 11px !important; font-weight: 600 !important; }
+/* buttons */
 .stButton > button {
-  background: var(--blue) !important; color: #fff !important;
-  border: none !important; border-radius: 8px !important;
-  font-weight: 600 !important; width: 100% !important;
+    background: #00d4ff !important;
+    color: #04080f !important;
+    border: none !important;
+    font-family: 'Bebas Neue', sans-serif !important;
+    font-size: 18px !important;
+    letter-spacing: 2px !important;
+    border-radius: 4px !important;
+    padding: 12px 28px !important;
+    width: 100% !important;
+    transition: all .15s !important;
 }
-.stButton > button[kind="secondary"] {
-  background: transparent !important; color: var(--mu) !important;
-  border: 1px solid var(--b2) !important;
+.stButton > button:hover { background: #00bbee !important; }
+
+/* text areas */
+.stTextArea textarea {
+    background: #0d1624 !important;
+    border: 1px solid #162540 !important;
+    color: #e0eaf8 !important;
+    font-family: 'DM Mono', monospace !important;
+    font-size: 12px !important;
+    border-radius: 4px !important;
 }
-.stRadio > div { gap: 6px !important; }
-.stRadio > div > label {
-  background: var(--sf) !important; border: 1px solid var(--b1) !important;
-  border-radius: 8px !important; padding: 10px 12px !important;
-  cursor: pointer !important; width: 100% !important;
+
+/* tabs */
+.stTabs [data-baseweb="tab-list"] {
+    background: #0d1624 !important;
+    border-radius: 4px !important;
+    gap: 4px !important;
+    padding: 4px !important;
 }
-.stAlert { border-radius: 8px !important; }
+.stTabs [data-baseweb="tab"] {
+    font-family: 'DM Mono', monospace !important;
+    font-size: 12px !important;
+    letter-spacing: 1px !important;
+    color: #6a8aaa !important;
+    background: transparent !important;
+    border-radius: 3px !important;
+    padding: 8px 16px !important;
+}
+.stTabs [aria-selected="true"] {
+    background: #162540 !important;
+    color: #00d4ff !important;
+}
+
+/* dataframe */
+[data-testid="stDataFrame"] {
+    background: #080f1a !important;
+    border: 1px solid #162540 !important;
+    border-radius: 6px !important;
+}
+
+/* expander */
+.streamlit-expanderHeader {
+    background: #080f1a !important;
+    border: 1px solid #162540 !important;
+    border-radius: 6px !important;
+    font-family: 'DM Mono', monospace !important;
+    font-size: 12px !important;
+    color: #6a8aaa !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
-# ── Top Navbar ────────────────────────────────────────────────────────────────
-st.markdown("""
-<div class="on-nav">
-  <div class="on-logo-wrap">
-    <div class="on-logo">🤝</div>
-    <div class="on-brand">Negotiator<span style="color:#4f9cf9">AI</span></div>
-    <div class="on-badge">AI PROCUREMENT AGENT</div>
-  </div>
-  <div style="font-size:11px;color:#5a6480;font-family:'Courier New',monospace">
-    Groq · LLaMA 3.3 70B · 4-Step Wizard
-  </div>
-</div>
-""", unsafe_allow_html=True)
+def fmt(n):
+    return f"Rs.{int(n):,}"
 
-# ── Layout ────────────────────────────────────────────────────────────────────
-left, right = st.columns([1.2, 1],gap="small")
+def nav_html():
+    return """
+    <div style="display:flex;align-items:center;justify-content:space-between;
+                padding:20px 0;border-bottom:1px solid #162540;margin-bottom:36px">
+      <div style="display:flex;align-items:center;gap:12px">
+        <div style="width:36px;height:36px;background:#00d4ff;
+                    clip-path:polygon(50% 0%,100% 25%,100% 75%,50% 100%,0% 75%,0% 25%);
+                    display:flex;align-items:center;justify-content:center;
+                    font-family:'Bebas Neue',sans-serif;font-size:18px;color:#04080f">V</div>
+        <div style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:2px">
+          Vendor<span style="color:#00d4ff">IQ</span></div>
+      </div>
+      <div style="font-family:'DM Mono',monospace;font-size:11px;color:#6a8aaa;
+                  border:1px solid #162540;padding:4px 12px;border-radius:2px;letter-spacing:1px">
+        PROCUREMENT INTELLIGENCE AGENT</div>
+    </div>
+    <div style="margin-bottom:40px">
+      <div style="font-family:'DM Mono',monospace;font-size:11px;letter-spacing:3px;
+                  color:#00d4ff;text-transform:uppercase;margin-bottom:10px;opacity:.8">
+        Track 3 — Cost Intelligence &amp; Autonomous Action</div>
+      <div style="font-family:'Bebas Neue',sans-serif;font-size:clamp(40px,6vw,72px);
+                  line-height:.95;letter-spacing:1px;margin-bottom:14px">
+        DETECT.<br><span style="color:#00d4ff">CONSOLIDATE.</span><br>SAVE.</div>
+      <div style="font-size:15px;color:#6a8aaa;max-width:540px;line-height:1.7;font-weight:300">
+        AI-powered vendor deduplication and spend optimization.
+        Upload 500+ vendors, get a prioritized action plan in seconds.</div>
+    </div>"""
 
-with left:
-    st.markdown("<div style='padding:24px 12px 0'>", unsafe_allow_html=True)
+st.markdown(nav_html(), unsafe_allow_html=True)
 
-    # Hero
+# ── SESSION STATE ─────────────────────────────────────────────────────────────
+if "results" not in st.session_state:
+    st.session_state.results = None
+
+# ── INPUT SECTION ─────────────────────────────────────────────────────────────
+if st.session_state.results is None:
     st.markdown("""
-    <div style='margin-bottom:18px'>
-      <div class="hero-label">AI-Powered Procurement Negotiation</div>
-      <div class="hero-h1">
-        <span class="c-white">One Tool.</span><br>
-        <span class="c-blue">Negotiate.</span><br>
-        <span class="c-green">Save More.</span>
+    <div style="background:#080f1a;border:1px solid #162540;border-radius:6px;
+                padding:28px;position:relative;overflow:hidden;margin-bottom:24px">
+      <div style="position:absolute;top:0;left:0;right:0;height:2px;
+                  background:linear-gradient(90deg,transparent,#00d4ff,transparent)"></div>
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:20px">
+        <div style="font-family:'DM Mono',monospace;font-size:11px;color:#00d4ff;
+                    border:1px solid #00d4ff;width:24px;height:24px;
+                    display:flex;align-items:center;justify-content:center;
+                    border-radius:2px;opacity:.7">01</div>
+        <div style="font-family:'Bebas Neue',sans-serif;font-size:20px;letter-spacing:1px">
+          VENDOR DATA INPUT</div>
       </div>
-      <p style='font-size:13px;color:var(--mu);line-height:1.75;margin-bottom:12px'>
-        NegotiatorAI detects the best leverage, crafts killer emails, and handles vendor replies automatically.
-      </p>
-      <div class="feat-tags">
-        <span class="feat-tag">Email Crafter</span>
-        <span class="feat-tag">Reply Handler</span>
-        <span class="feat-tag">Power Analyser</span>
-        <span class="feat-tag">Leverage Max</span>
-        <span class="feat-tag">Deal Closer</span>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
+    </div>""", unsafe_allow_html=True)
 
-    # Step bar
-    s = st.session_state.step
-    def tab_cls(n):
-        if n == s: return "active"
-        if n < s: return "done"
-        return ""
+    tab_sample, tab_csv, tab_json = st.tabs(["USE SAMPLE DATA", "PASTE CSV", "PASTE JSON"])
 
+    vendors_to_run = None
+
+    with tab_sample:
+        st.markdown("""
+        <div style="background:#0d1624;border:1px solid #162540;border-left:3px solid #00d4ff;
+                    border-radius:4px;padding:16px;font-size:13px;color:#6a8aaa;line-height:1.7">
+          <strong style="color:#00d4ff">20 pre-loaded vendors</strong> including duplicates
+          (Infosys/Infosys Limited, TCS/Tata Consultancy Services, AWS/Amazon Web Services,
+          Microsoft/Microsoft Corp, HCL/HCL Tech, Wipro/Wipro Technologies) and low-value/useless
+          vendors for a full demo.
+        </div>""", unsafe_allow_html=True)
+        if st.button("RUN VENDOR INTELLIGENCE AGENT", key="run_sample"):
+            vendors_to_run = generate_sample_vendors()
+
+    with tab_csv:
+        csv_input = st.text_area(
+            "Paste CSV data",
+            placeholder="id,name,service,annual_spend,transactions,rating,location,contact\nV001,Infosys Ltd,IT Consulting,850000,42,4.2,Bangalore,info@corp.com\n...",
+            height=140, label_visibility="collapsed")
+        st.markdown('<div style="font-family:DM Mono,monospace;font-size:11px;color:#4a6080;margin-top:6px">'
+                    'Required columns: name, service, annual_spend &nbsp;|&nbsp; Optional: id, transactions, rating, location, contact</div>',
+                    unsafe_allow_html=True)
+        if st.button("RUN VENDOR INTELLIGENCE AGENT", key="run_csv"):
+            if not csv_input.strip():
+                st.error("Please paste CSV data first.")
+            else:
+                vendors_to_run = parse_vendors(csv_input)
+                if not vendors_to_run:
+                    st.error("Could not parse CSV data.")
+                    vendors_to_run = None
+
+    with tab_json:
+        json_input = st.text_area(
+            "Paste JSON data",
+            placeholder='[{"id":"V001","name":"Infosys Ltd","service":"IT Consulting","annual_spend":850000,...}]',
+            height=140, label_visibility="collapsed")
+        if st.button("RUN VENDOR INTELLIGENCE AGENT", key="run_json"):
+            if not json_input.strip():
+                st.error("Please paste JSON data first.")
+            else:
+                vendors_to_run = parse_vendors(json_input)
+                if not vendors_to_run:
+                    st.error("Could not parse JSON data.")
+                    vendors_to_run = None
+
+    # ── RUN AGENT ─────────────────────────────────────────────────────────────
+    if vendors_to_run:
+        st.markdown("""
+        <div style="background:#080f1a;border:1px solid #162540;border-radius:6px;
+                    overflow:hidden;margin-bottom:24px">
+          <div style="display:flex;align-items:center;gap:10px;padding:14px 20px;
+                      border-bottom:1px solid #111d2e;background:#0d1624">
+            <div style="width:8px;height:8px;border-radius:50%;background:#00d4ff;
+                        animation:pulse 1.5s ease infinite"></div>
+            <div style="font-family:'DM Mono',monospace;font-size:12px;letter-spacing:1px;color:#00d4ff">
+              AGENT RUNNING — REASONING IN PROGRESS</div>
+          </div>
+        </div>""", unsafe_allow_html=True)
+
+        log_placeholder = st.empty()
+        progress_bar = st.progress(0)
+
+        with st.spinner(""):
+            data = run_agent(vendors_to_run, log_placeholder, progress_bar)
+
+        st.session_state.results = data
+        st.rerun()
+
+# ── RESULTS SECTION ───────────────────────────────────────────────────────────
+else:
+    data      = st.session_state.results
+    report    = data["report"]
+    duplicates= data["duplicates"]
+    low_value = data["low_value"]
+    vendors   = data["vendors"]
+
+    # KPI row
+    c1,c2,c3,c4,c5 = st.columns(5)
+    with c1:
+        st.metric("TOTAL VENDORS", report["total_vendors"], help="Analyzed")
+    with c2:
+        st.metric("DUPLICATE PAIRS", report["duplicate_pairs"], help="Overlapping vendors")
+    with c3:
+        st.metric("LOW-VALUE FLAGS", report["low_value_vendors"], help="Review or terminate")
+    with c4:
+        st.metric("POTENTIAL SAVINGS", fmt(report["potential_savings"]), help=f"{report['savings_percent']}% of total spend")
+    with c5:
+        st.metric("TOTAL SPEND", fmt(report["total_spend"]), help="Annual procurement spend")
+
+    st.markdown("<div style='margin-bottom:16px'></div>", unsafe_allow_html=True)
+
+    # Executive summary
     st.markdown(f"""
-    <div class="steps-bar">
-      <div class="step-tab {tab_cls(1)}">
-        <span class="st-num">01</span><span class="st-ico">🔧</span><span class="st-label">Setup</span>
-      </div>
-      <div class="step-tab {tab_cls(2)}">
-        <span class="st-num">02</span><span class="st-ico">📋</span><span class="st-label">Deal Info</span>
-      </div>
-      <div class="step-tab {tab_cls(3)}">
-        <span class="st-num">03</span><span class="st-ico">⚔️</span><span class="st-label">Strategy</span>
-      </div>
-      <div class="step-tab {tab_cls(4)}">
-        <span class="st-num">04</span><span class="st-ico">🚀</span><span class="st-label">Track</span>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
+    <div style="background:#080f1a;border:1px solid #162540;border-left:3px solid #00d4ff;
+                border-radius:6px;padding:22px 26px;margin-bottom:28px">
+      <div style="font-family:'DM Mono',monospace;font-size:10px;letter-spacing:2px;
+                  color:#00d4ff;text-transform:uppercase;margin-bottom:10px;opacity:.8">
+        Executive Summary</div>
+      <div style="font-size:15px;line-height:1.75;color:#6a8aaa;font-weight:300">
+        {report['executive_summary']}</div>
+    </div>""", unsafe_allow_html=True)
 
-    # ── STEP 1: SETUP ─────────────────────────────────────────────────────────
-    if s == 1:
-        api_ready = bool(GROQ_API_KEY)
-        tip_color = "rgba(0,224,150,0.06)" if api_ready else "rgba(79,156,249,0.06)"
-        tip_border = "rgba(0,224,150,0.25)" if api_ready else "rgba(79,156,249,0.18)"
-        tip_icon = "✅" if api_ready else "💡"
-        tip_text = (
-            "<strong style='color:var(--green)'>Groq API key loaded</strong> — the AI engine is ready."
-            if api_ready else
-            "<strong style='color:var(--red)'>Missing:</strong> Set GROQ_API_KEY in your environment."
-        )
+    # ── ACTION PLAN ──
+    st.markdown("""
+    <div style="display:flex;align-items:baseline;gap:12px;margin-bottom:16px;
+                padding-bottom:12px;border-bottom:1px solid #111d2e">
+      <div style="font-family:'Bebas Neue',sans-serif;font-size:22px;letter-spacing:1px">
+        PRIORITY ACTION PLAN</div>
+    </div>""", unsafe_allow_html=True)
+
+    TYPE_COLORS = {
+        "CONSOLIDATE": ("rgba(0,212,255,.1)", "#00d4ff", "rgba(0,212,255,.2)"),
+        "TERMINATE":   ("rgba(255,64,96,.1)",  "#ff4060", "rgba(255,64,96,.2)"),
+        "REVIEW":      ("rgba(255,176,32,.1)", "#ffb020", "rgba(255,176,32,.2)"),
+    }
+    PRIORITY_COLORS = {"HIGH": "#ff4060", "MEDIUM": "#ffb020", "LOW": "#6a8aaa"}
+
+    if report["action_plan"]:
+        rows_html = ""
+        for a in report["action_plan"]:
+            tc = TYPE_COLORS.get(a["type"], TYPE_COLORS["REVIEW"])
+            pc = PRIORITY_COLORS.get(a["priority"], "#6a8aaa")
+            rows_html += f"""
+            <tr style="transition:background .2s">
+              <td style="padding:12px 14px">
+                <div style="font-family:'DM Mono',monospace;font-size:11px;width:28px;height:28px;
+                            border-radius:2px;display:flex;align-items:center;justify-content:center;
+                            background:#162540;color:#00d4ff">{a['rank']}</div></td>
+              <td style="padding:12px 14px">
+                <span style="display:inline-block;font-family:'DM Mono',monospace;font-size:10px;
+                             letter-spacing:1px;padding:3px 8px;border-radius:2px;
+                             background:{tc[0]};color:{tc[1]};border:1px solid {tc[2]}">{a['type']}</span></td>
+              <td style="padding:12px 14px;max-width:320px;font-size:13px;color:#6a8aaa">{a['action']}</td>
+              <td style="padding:12px 14px;font-family:'DM Mono',monospace;color:#00e090;font-size:13px">{fmt(a['savings'])}</td>
+              <td style="padding:12px 14px;color:{pc};font-size:13px;font-weight:500">{a['priority']}</td>
+              <td style="padding:12px 14px;font-family:'DM Mono',monospace;font-size:11px;color:#4a6080">{a['timeline']}</td>
+            </tr>"""
+
         st.markdown(f"""
-        <div class="srule"><div class="srule-title">Configuration</div><div class="srule-line"></div></div>
-        <div class="tip-box" style="background:{tip_color};border-color:{tip_border}">
-          {tip_icon}&nbsp;<span>{tip_text}</span>
-        </div>
-        """, unsafe_allow_html=True)
+        <div style="overflow-x:auto;margin-bottom:32px">
+        <table style="width:100%;border-collapse:collapse">
+          <thead>
+            <tr style="background:#0d1624">
+              {''.join(f'<th style="font-family:DM Mono,monospace;font-size:10px;letter-spacing:2px;color:#4a6080;text-transform:uppercase;padding:10px 14px;text-align:left;border-bottom:1px solid #162540">{h}</th>' for h in ['#','TYPE','ACTION','SAVINGS','PRIORITY','TIMELINE'])}
+            </tr>
+          </thead>
+          <tbody>{rows_html}</tbody>
+        </table></div>""", unsafe_allow_html=True)
 
-        with st.form("form_step1"):
-            c1, c2 = st.columns(2)
-            with c1:
-                name = st.text_input("Your Name / Company ✱", placeholder="Rahul Sharma / TechCorp",
-                                     value=st.session_state.get("cfg_name","Your Company"))
-            with c2:
-                email = st.text_input("Your Email ✱", placeholder="procurement@company.com",
-                                      value=st.session_state.get("cfg_email","procurement@company.com"))
-            go1 = st.form_submit_button("→  Continue to Deal Details", disabled=not api_ready)
-        if go1:
-            if not name.strip() or not email.strip():
-                st.error("Name and email are required.")
-            else:
-                st.session_state.cfg_name = name.strip()
-                st.session_state.cfg_email = email.strip()
-                st.session_state.step = 2
-                st.rerun()
+    # ── DUPLICATE PAIRS ──
+    st.markdown("""
+    <div style="display:flex;align-items:baseline;gap:12px;margin-bottom:16px;
+                padding-bottom:12px;border-bottom:1px solid #111d2e">
+      <div style="font-family:'Bebas Neue',sans-serif;font-size:22px;letter-spacing:1px">
+        DUPLICATE VENDOR PAIRS</div>
+    </div>""", unsafe_allow_html=True)
 
-    # ── STEP 2: DEAL INFO ─────────────────────────────────────────────────────
-    elif s == 2:
-        st.markdown("""<div class="srule"><div class="srule-title">Procurement Information</div><div class="srule-line"></div></div>""", unsafe_allow_html=True)
-        with st.form("form_step2"):
-            c1, c2 = st.columns(2)
-            with c1: vendor = st.text_input("Vendor / Supplier ✱", placeholder="Samsung India, Infosys...", value=st.session_state.get("n_vendor",""))
-            with c2: vemail = st.text_input("Vendor Email", placeholder="sales@vendor.com", value=st.session_state.get("n_email",""))
-            c1, c2, c3 = st.columns(3)
-            with c1: product = st.text_input("Product / Service ✱", placeholder="Laptops, Raw Materials...", value=st.session_state.get("n_product",""))
-            with c2: qty = st.text_input("Quantity", placeholder="50 units, 500 kg...", value=st.session_state.get("n_qty",""))
-            with c3: delivery = st.selectbox("Delivery Needed",
-                ["Immediately / ASAP","Within 2 weeks","Within 1 month","Within 3 months","Flexible"], index=2)
-            c1, c2, c3 = st.columns(3)
-            with c1: quoted = st.text_input("Vendor's Quoted Price ✱", placeholder="₹5,00,000", value=st.session_state.get("n_quoted",""))
-            with c2: target = st.text_input("Your Target Price ✱", placeholder="₹3,50,000", value=st.session_state.get("n_target",""))
-            with c3: budget = st.text_input("Max Budget (private)", placeholder="₹4,00,000", value=st.session_state.get("n_budget",""))
-            c1, c2 = st.columns(2)
-            with c1: payment = st.selectbox("Payment Terms",
-                ["100% upfront — best leverage","50/50 split","Net 30 days","Net 60 days","Milestone-based"])
-            with c2: tone = st.selectbox("Negotiation Tone",
-                ["Firm & professional","Highly aggressive","Collaborative partner","Urgent — hard deadline"])
-            c1b, c2b = st.columns(2)
-            with c1b: back2 = st.form_submit_button("← Back")
-            with c2b: go2 = st.form_submit_button("→  Continue to Strategy")
-        if back2:
-            st.session_state.step = 1; st.rerun()
-        if go2:
-            if not vendor.strip() or not product.strip() or not quoted.strip() or not target.strip():
-                st.error("Vendor, product, quoted price and target price are required.")
-            else:
-                for k,v in [("n_vendor",vendor),("n_email",vemail),("n_product",product),
-                             ("n_qty",qty),("n_delivery",delivery),("n_quoted",quoted),
-                             ("n_target",target),("n_budget",budget),("n_payment",payment),("n_tone",tone)]:
-                    st.session_state[k] = v
-                st.session_state.step = 3; st.rerun()
-
-    # ── STEP 3: STRATEGY ──────────────────────────────────────────────────────
-    elif s == 3:
-        st.markdown("""<div class="srule"><div class="srule-title">Negotiation Strategy</div><div class="srule-line"></div></div>""", unsafe_allow_html=True)
-
-        strats = [
-            ("📦","Bulk Discount","Use quantity as leverage","bulk volume discount"),
-            ("💰","Pay Upfront","Offer instant full payment","full upfront payment for discount"),
-            ("🤝","Long-term Partner","Promise repeat business","long-term partnership and repeat business"),
-            ("⚔️","Beat Competitor","Mention rival quotes","competitor price matching — we have better quotes"),
-            ("📊","Budget Cap","Hard limit approach","strict budget constraint — cannot exceed"),
-            ("🎁","Bundle Deal","Package multiple items","bundle multiple products for total deal"),
-        ]
-        saved_strat = st.session_state.get("n_strategy","bulk volume discount")
-        strat_names  = [f"{s[0]} {s[1]}" for s in strats]
-        strat_values = [s[3] for s in strats]
-
-        st.markdown("""<div style='font-family:"Courier New",monospace;font-size:9px;font-weight:600;letter-spacing:2px;text-transform:uppercase;color:var(--mu);margin-bottom:10px'>Primary Strategy</div>""", unsafe_allow_html=True)
-        strat_choice = st.radio("", strat_names, horizontal=False,
-                                index=strat_values.index(saved_strat) if saved_strat in strat_values else 0,
-                                label_visibility="collapsed")
-        chosen_strat = strat_values[strat_names.index(strat_choice)]
-
-        st.markdown("""<div class="srule" style="margin-top:16px"><div class="srule-title">Leverage & Context</div><div class="srule-line"></div></div>""", unsafe_allow_html=True)
-
-        with st.form("form_step3"):
-            leverage = st.text_area("Your Leverage Points ✱",
-                placeholder="List everything:\n• Buying in bulk (50 units)\n• Can pay 100% upfront today\n• Loyal customer 3 years\n• Comparing 3 quotes right now",
-                height=110, value=st.session_state.get("n_leverage",""))
-            comp = st.text_input("Competitor Quotes (very powerful)",
-                placeholder="e.g. Competitor A quoted ₹3,80,000 · Vendor B at ₹4,00,000",
-                value=st.session_state.get("n_comp",""))
-            context = st.text_area("Additional Context (optional)",
-                placeholder="Past relationship, previous orders, urgency...",
-                height=68, value=st.session_state.get("n_context",""))
-
-            power = 0
-            for fk in ["n_vendor","n_email","n_product","n_quoted","n_target"]:
-                if st.session_state.get(fk,""): power += 10
-            if len(st.session_state.get("n_leverage","")) > 30: power += 25
-            elif st.session_state.get("n_leverage",""): power += 10
-            if st.session_state.get("n_comp",""): power += 15
-            if st.session_state.get("n_budget",""): power += 5
-
-            pcolor = "#ff4f5e" if power < 25 else "#ff6b35" if power < 50 else "#f5c542" if power < 75 else "#00e096"
-            plabel = "Weak" if power < 25 else "Building" if power < 50 else "Strong 💪" if power < 75 else "Maximum 🔥"
-            st.markdown(f"""
-            <div style='margin-bottom:8px'>
-              <div style='display:flex;justify-content:space-between;margin-bottom:6px'>
-                <span style='font-family:"Courier New",monospace;font-size:9px;font-weight:600;letter-spacing:2px;text-transform:uppercase;color:var(--mu)'>Negotiation Power</span>
-                <span style='font-family:"Courier New",monospace;font-size:12px;font-weight:700;color:{pcolor}'>{power}% {plabel}</span>
-              </div>
-              <div class="power-track"><div class="power-fill" style="width:{power}%;background:{pcolor}"></div></div>
-            </div>
-            """, unsafe_allow_html=True)
-
-            c1b, c2b = st.columns(2)
-            with c1b: back3 = st.form_submit_button("← Back")
-            with c2b: go3 = st.form_submit_button("🚀  Generate Email")
-
-        if back3:
-            st.session_state.step = 2; st.rerun()
-        if go3:
-            if not leverage.strip():
-                st.error("Please add at least one leverage point — this is how the AI negotiates!")
-            else:
-                st.session_state.n_leverage = leverage
-                st.session_state.n_comp = comp
-                st.session_state.n_context = context
-                st.session_state.n_strategy = chosen_strat
-
-                v = st.session_state
-                SYS = """You are an elite procurement negotiation AI agent. Write devastatingly effective negotiation emails.
-Rules:
-- Use EVERY leverage point — never waste a single one
-- Be firm and authoritative, never desperate or weak
-- Make a SPECIFIC counter-offer with crystal-clear reasoning
-- Use competitor quotes as hard leverage if provided
-- Create urgency: mention a decision deadline (end of week)
-- Never reveal the maximum budget
-- Sign professionally as the buyer
-Return ONLY valid JSON (no markdown):
-{"subject":"subject","email":"full email body","reasoning":"why this will work (2 sentences)","confidence":85,"predicted_response":"vendor will likely say..."}"""
-
-                USR = f"""Write procurement negotiation email:
-From: {v.cfg_name} ({v.cfg_email})
-To: {v.n_vendor}
-Product: {v.n_product}{f" | Qty: {v.n_qty}" if v.n_qty else ""}
-Delivery: {v.n_delivery}
-Quoted: {v.n_quoted}
-Target: {v.n_target}{f"\nMax budget (NEVER reveal): {v.n_budget}" if v.n_budget else ""}
-Payment offer: {v.n_payment}
-Tone: {v.n_tone}
-Strategy: {v.n_strategy}
-Leverage:
-{leverage}{f"\nCompetitor quotes (use hard): {comp}" if comp else ""}{f"\nContext: {context}" if context else ""}
-
-Craft the most powerful email to get us to {v.n_target}. Sign as {v.cfg_name}."""
-
-                with st.spinner("LLaMA 3.3 70B crafting your negotiation email..."):
-                    try:
-                        raw = call_groq([
-                            {"role":"system","content":SYS},
-                            {"role":"user","content":USR}
-                        ])
-                        result = parse_json(raw)
-                        if not result:
-                            result = {"subject":f"Re: {v.n_product} — Pricing Discussion",
-                                      "email":raw,"reasoning":"Direct leverage approach.",
-                                      "confidence":72,"predicted_response":"Vendor will offer partial reduction."}
-                        st.session_state.result = result
-                        st.session_state.error = None
-
-                        import time
-                        deal = {
-                            "id": int(time.time()*1000),
-                            "vendor": v.n_vendor, "vendorEmail": v.n_email,
-                            "product": v.n_product, "qty": v.n_qty,
-                            "quoted": v.n_quoted, "target": v.n_target,
-                            "myName": v.cfg_name, "myEmail": v.cfg_email,
-                            "subject": result["subject"], "emailBody": result["email"],
-                            "confidence": result.get("confidence",72),
-                            "status": "sent",
-                            "timestamp": __import__('datetime').datetime.now().strftime("%d %b %Y, %H:%M"),
-                            "rounds": 0
-                        }
-                        st.session_state.deals = [deal] + (st.session_state.deals or [])
-                        st.session_state.step = 4
-                        st.rerun()
-                    except Exception as e:
-                        st.session_state.error = str(e)
-                        st.error(f"API Error: {e}")
-
-    # ── STEP 4: TRACK ─────────────────────────────────────────────────────────
-    elif s == 4:
-        if st.button("← New Negotiation"):
-            st.session_state.step = 1
-            st.session_state.result = None
-            st.rerun()
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-# ── RIGHT PANEL ───────────────────────────────────────────────────────────────
-with right:
-    st.markdown(
-        "<div style='padding:24px 16px 0;border-left:1px solid var(--b1);height:auto;'>",
-        unsafe_allow_html=True
-    )
-    s = st.session_state.step
-
-    # ── Step 1 right panel: Agent cards ───────────────────────────────────────
-    if s == 1:
-        st.markdown("""
-        <div style='font-family:"Courier New",monospace;font-size:10px;font-weight:600;letter-spacing:3px;
-        color:var(--mu);text-transform:uppercase;padding-bottom:14px;
-        border-bottom:1px solid var(--b1);margin-bottom:16px'>
-          Negotiation Agents — 5 Active
-        </div>
-        """, unsafe_allow_html=True)
-
-        agents = [
-            ("#4f9cf9","📝","Email Crafter",    "Writes devastating negotiation emails tailored to your leverage"),
-            ("#00e096","🔄","Reply Handler",     "Reads vendor responses and auto-generates counter-offers"),
-            ("#f5c542","📊","Power Analyser",    "Scores your negotiation strength and suggests improvements"),
-            ("#ff4f5e","⚔️","Leverage Maximiser","Extracts every advantage from your context data"),
-            ("#a855f7","🏆","Deal Closer",       "Knows when to push harder and when to close"),
-        ]
-        for color, ico, name, desc in agents:
-            st.markdown(f"""
-            <div class="agent-card" style="border-left:3px solid {color}">
-              <div class="agent-ico" style="border-color:{color}33">{ico}</div>
-              <div class="agent-info">
-                <div class="agent-name">{name}</div>
-                <div class="agent-desc">{desc}</div>
-              </div>
-              <span class="agent-badge badge-active">ACTIVE</span>
-            </div>
-            """, unsafe_allow_html=True)
-
-        st.markdown("""
-        <div class="stat-strip" style="display:grid;grid-template-columns:repeat(3,1fr);
-        border:1px solid var(--b1);border-radius:10px;overflow:hidden;margin-top:20px">
-          <div class="stat-cell" style="padding:18px;border-right:1px solid var(--b1);text-align:center">
-            <div class="stat-val" style="color:var(--blue)">5</div>
-            <div class="stat-lbl">Agents</div>
-          </div>
-          <div class="stat-cell" style="padding:18px;border-right:1px solid var(--b1);text-align:center">
-            <div class="stat-val" style="color:var(--green)">AI</div>
-            <div class="stat-lbl">Powered</div>
-          </div>
-          <div class="stat-cell" style="padding:18px;text-align:center">
-            <div class="stat-val" style="color:var(--yellow)">4s</div>
-            <div class="stat-lbl">Avg Speed</div>
-          </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    # ── Steps 2 & 3 right panel: How It Works ─────────────────────────────────
-    elif s in [2, 3]:
-        st.markdown("""
-        <div style='font-family:"Courier New",monospace;font-size:10px;font-weight:600;
-        letter-spacing:3px;color:var(--mu);text-transform:uppercase;
-        padding-bottom:14px;border-bottom:1px solid var(--b1);margin-bottom:16px'>
-          How It Works
-        </div>
-        """, unsafe_allow_html=True)
-
-        steps_info = [
-            ("#4f9cf9","1","Fill deal details",   "Enter vendor info, quoted price and your target in Step 2"),
-            ("#00e096","2","Choose strategy",      "Pick the negotiation angle that fits your situation in Step 3"),
-            ("#f5c542","3","Add leverage",         "The more leverage points you list, the stronger your email"),
-            ("#a855f7","4","AI generates email",   "LLaMA 3.3 70B on Groq writes a powerful negotiation email"),
-            ("#ff4f5e","5","Handle replies",        "Paste vendor replies and AI auto-crafts the perfect counter"),
-        ]
-        for color, num, title, desc in steps_info:
-            st.markdown(f"""
-            <div class="how-step" style="border-left:3px solid {color};padding-left:12px">
-              <div class="how-num" style="border:1px solid {color}44;color:{color}">{num}</div>
-              <div>
-                <div class="how-title">{title}</div>
-                <div class="how-desc">{desc}</div>
-              </div>
-            </div>
-            """, unsafe_allow_html=True)
-
-    # ── Step 4 right panel: Email output + Deal tracker ───────────────────────
-    elif s == 4:
-        result = st.session_state.get("result")
-        deals  = st.session_state.get("deals", [])
-
-        if result:
-            st.markdown("""
-            <div style='display:flex;align-items:center;justify-content:space-between;
-            padding-bottom:14px;border-bottom:1px solid var(--b1);margin-bottom:14px'>
-              <span style='font-size:16px;font-weight:700;color:var(--tx)'>Email Generated</span>
-              <span class="ready-badge">✓ READY</span>
-            </div>
-            """, unsafe_allow_html=True)
-
-            conf = result.get("confidence", 72)
-            pct  = fmt_pct(st.session_state.get("n_quoted",""), st.session_state.get("n_target",""))
-            c1, c2, c3 = st.columns(3)
-            for col, label, val, color in [
-                (c1, "Target Price", st.session_state.get("n_target","—"), "var(--green)"),
-                (c2, "Confidence",   f"{conf}%",                           "var(--blue)"),
-                (c3, "Reduction",    pct or "—",                           "var(--yellow)"),
-            ]:
-                with col:
-                    st.markdown(f"""
-                    <div class="kpi-card">
-                      <div class="kpi-label">{label}</div>
-                      <div class="kpi-val" style="color:{color}">{val}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
-
-            st.markdown(f"""
-            <div class="result-card rc-yellow">
-              <div class="rc-header" style="color:var(--yellow)">Why This Will Work</div>
-              <div class="rc-content">{result.get("reasoning","")}</div>
-            </div>
-            <div class="result-card rc-blue">
-              <div class="rc-header" style="color:var(--blue)">Predicted Vendor Response</div>
-              <div class="rc-content">{result.get("predicted_response","")}</div>
-            </div>
-            """, unsafe_allow_html=True)
-
-            v = st.session_state
-            st.markdown(f"""
-            <div class="email-preview">
-              <div class="ep-header">
-                <div class="ep-row"><span class="ep-k">FROM</span><span class="ep-v">{v.get("cfg_name","")} &lt;{v.get("cfg_email","")}&gt;</span></div>
-                <div class="ep-row"><span class="ep-k">TO</span><span class="ep-v">{v.get("n_vendor","")} &lt;{v.get("n_email","")}&gt;</span></div>
-                <div class="ep-row"><span class="ep-k">SUBJECT</span><span class="ep-v">{result.get("subject","")}</span></div>
-              </div>
-              <div class="ep-body">{result.get("email","").replace("<","&lt;").replace(">","&gt;")}</div>
-            </div>
-            """, unsafe_allow_html=True)
-
-            st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
-
-        # Deal Tracker
-        st.markdown("""<div class="srule"><div class="srule-title">Deal Tracker</div><div class="srule-line"></div></div>""", unsafe_allow_html=True)
-
-        if not deals:
-            st.markdown("""
-            <div class="empty-state">
-              <div class="ei">📁</div>
-              <h3>No deals yet</h3>
-              <p>Complete the form to see deals here</p>
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            deal_colors = {"sent":"#4f9cf9","negotiating":"#f5c542","closed":"#00e096"}
-            for deal in deals:
-                status = deal.get("status","sent")
-                ico = "📤" if status=="sent" else "🔄" if status=="negotiating" else "🏆"
-                badge_cls = "dc-sent" if status=="sent" else "dc-neg" if status=="negotiating" else "dc-done"
-                badge_label = "Email Sent" if status=="sent" else f"Negotiating · Round {deal.get('rounds',0)}" if status=="negotiating" else "Deal Closed"
-                display_price = deal.get("finalPrice") or deal.get("predicted") or deal.get("target","")
-                pct_str = fmt_pct(deal.get("quoted",""), display_price)
-                dc = deal_colors.get(status, "#4f9cf9")
-
+    if not duplicates:
+        st.markdown('<div style="font-family:DM Mono,monospace;font-size:13px;color:#4a6080;'
+                    'padding:24px;text-align:center;border:1px dashed #162540;border-radius:4px">'
+                    'No duplicate vendors detected</div>', unsafe_allow_html=True)
+    else:
+        cols = st.columns(min(2, len(duplicates)))
+        for idx, d in enumerate(duplicates):
+            col = cols[idx % 2]
+            p, s = d["primary"], d["secondary"]
+            pc_color = "#ff4060" if d["priority"]=="HIGH" else "#ffb020" if d["priority"]=="MEDIUM" else "#6a8aaa"
+            with col:
                 st.markdown(f"""
-                <div class="deal-card" style="border-left:3px solid {dc}">
-                  <div class="deal-top">
-                    <div style="font-size:18px;flex-shrink:0;margin-top:2px">{ico}</div>
-                    <div style="flex:1;min-width:0">
-                      <div class="deal-vendor">{deal['vendor']}</div>
-                      <div class="deal-product">{deal['product']}{f" — {deal['qty']}" if deal.get('qty') else ""}</div>
-                      <div style="font-size:10px;color:var(--mu);font-style:italic;margin-bottom:4px">{deal.get('subject','')}</div>
-                      <span class="dc {badge_cls}">{badge_label}</span>
+                <div style="background:#080f1a;border:1px solid #162540;border-radius:6px;
+                            padding:18px;position:relative;overflow:hidden;margin-bottom:14px">
+                  <div style="position:absolute;top:0;left:0;right:0;height:2px;
+                              background:linear-gradient(90deg,#ff4060,#ffb020)"></div>
+                  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+                    <span style="font-family:'DM Mono',monospace;font-size:10px;padding:3px 8px;
+                                 background:rgba(255,64,96,.1);color:#ff4060;
+                                 border:1px solid rgba(255,64,96,.2);border-radius:2px">DUPLICATE</span>
+                    <span style="font-family:'DM Mono',monospace;font-size:10px;
+                                 letter-spacing:1px;color:{pc_color}">{d['priority']} PRIORITY</span>
+                  </div>
+                  <div style="margin-bottom:12px">
+                    <div style="display:flex;align-items:center;gap:8px;margin-bottom:7px">
+                      <div style="width:8px;height:8px;border-radius:50%;background:#00d4ff;flex-shrink:0"></div>
+                      <div>
+                        <div style="font-size:13px;font-weight:500;color:#e0eaf8">{p.get('name','')}</div>
+                        <div style="font-family:'DM Mono',monospace;font-size:11px;color:#6a8aaa">{p.get('service','')}</div>
+                      </div>
+                      <div style="margin-left:auto;font-family:'DM Mono',monospace;font-size:11px;color:#4a6080">
+                        Rs.{int(float(p.get('annual_spend',0) or 0)):,}</div>
                     </div>
-                    <div class="deal-prices">
-                      <div class="dp-orig">{deal['quoted']}</div>
-                      <div class="dp-current">{display_price}</div>
-                      {f'<div class="dp-save">↓ {pct_str} off</div>' if pct_str else ''}
+                    <div style="display:flex;align-items:center;gap:8px">
+                      <div style="width:8px;height:8px;border-radius:50%;background:#ff4060;flex-shrink:0"></div>
+                      <div>
+                        <div style="font-size:13px;font-weight:500;color:#e0eaf8">{s.get('name','')}</div>
+                        <div style="font-family:'DM Mono',monospace;font-size:11px;color:#6a8aaa">{s.get('service','')}</div>
+                      </div>
+                      <div style="margin-left:auto;font-family:'DM Mono',monospace;font-size:11px;color:#4a6080">
+                        Rs.{int(float(s.get('annual_spend',0) or 0)):,}</div>
                     </div>
                   </div>
-                </div>
-                """, unsafe_allow_html=True)
-
-                if status != "closed":
-                    col_a, col_b = st.columns(2)
-                    with col_a:
-                        if st.button(f"🔄 Handle Reply", key=f"reply_{deal['id']}"):
-                            st.session_state.handle_reply_id = deal["id"]
-                            st.rerun()
-                    with col_b:
-                        if st.button(f"✅ Close Deal", key=f"close_{deal['id']}"):
-                            deal["status"] = "closed"
-                            deal["finalPrice"] = deal.get("predicted") or deal["target"]
-                            st.rerun()
-
-            if st.session_state.handle_reply_id:
-                deal_id = st.session_state.handle_reply_id
-                deal = next((d for d in deals if d["id"] == deal_id), None)
-                if deal:
-                    st.markdown(f"""
-                    <div style='background:rgba(79,156,249,0.06);border:1px solid rgba(79,156,249,0.2);
-                    border-radius:8px;padding:14px;margin-top:12px;
-                    font-family:"Courier New",monospace;font-size:11px;color:var(--blue)'>
-                      Paste vendor reply for <strong style='color:var(--tx)'>{deal['vendor']}</strong> below:
+                  <div style="display:flex;gap:12px;margin-bottom:10px">
+                    <div style="flex:1">
+                      <div style="font-family:'DM Mono',monospace;font-size:10px;color:#4a6080;margin-bottom:4px">Name similarity</div>
+                      <div style="height:3px;background:#162540;border-radius:2px;overflow:hidden">
+                        <div style="height:100%;width:{d['name_similarity']}%;background:#ffb020;border-radius:2px"></div>
+                      </div>
+                      <div style="font-family:'DM Mono',monospace;font-size:10px;color:#6a8aaa;margin-top:3px">{d['name_similarity']}%</div>
                     </div>
-                    """, unsafe_allow_html=True)
+                    <div style="flex:1">
+                      <div style="font-family:'DM Mono',monospace;font-size:10px;color:#4a6080;margin-bottom:4px">Service match</div>
+                      <div style="height:3px;background:#162540;border-radius:2px;overflow:hidden">
+                        <div style="height:100%;width:{d['service_similarity']}%;background:#00d4ff;border-radius:2px"></div>
+                      </div>
+                      <div style="font-family:'DM Mono',monospace;font-size:10px;color:#6a8aaa;margin-top:3px">{d['service_similarity']}%</div>
+                    </div>
+                  </div>
+                  <div style="font-family:'DM Mono',monospace;font-size:12px;color:#00e090">
+                    Savings potential: Rs.{d['potential_savings']:,}</div>
+                </div>""", unsafe_allow_html=True)
 
-                    with st.form(f"reply_form_{deal_id}"):
-                        vendor_reply = st.text_area("Vendor's Reply Email",
-                            placeholder="Paste their full response here...", height=120)
-                        c1r, c2r = st.columns(2)
-                        with c1r: cancel_reply = st.form_submit_button("Cancel")
-                        with c2r: send_reply = st.form_submit_button("🤖 Generate Counter-Offer")
+    # ── LOW VALUE VENDORS ──
+    st.markdown("""
+    <div style="display:flex;align-items:baseline;gap:12px;margin-bottom:16px;
+                padding-bottom:12px;border-bottom:1px solid #111d2e">
+      <div style="font-family:'Bebas Neue',sans-serif;font-size:22px;letter-spacing:1px">
+        LOW-VALUE &amp; USELESS VENDORS</div>
+    </div>""", unsafe_allow_html=True)
 
-                    if cancel_reply:
-                        st.session_state.handle_reply_id = None
-                        st.rerun()
+    if not low_value:
+        st.markdown('<div style="font-family:DM Mono,monospace;font-size:13px;color:#4a6080;'
+                    'padding:24px;text-align:center;border:1px dashed #162540;border-radius:4px">'
+                    'No low-value vendors detected</div>', unsafe_allow_html=True)
+    else:
+        lv_cols = st.columns(min(3, len(low_value)))
+        for idx, l in enumerate(low_value):
+            v = l["vendor"]
+            col = lv_cols[idx % 3]
+            cls_color = "#ff4060" if l["recommendation"]=="TERMINATE" else "#ffb020"
+            with col:
+                reasons_html = "".join(
+                    f'<div style="font-size:12px;color:#6a8aaa;display:flex;align-items:center;gap:6px;padding:3px 0">'
+                    f'<span style="width:4px;height:4px;border-radius:50%;background:#ffb020;flex-shrink:0;display:inline-block"></span>'
+                    f'{r}</div>' for r in l["reasons"])
+                st.markdown(f"""
+                <div style="background:#080f1a;border:1px solid #162540;border-radius:6px;
+                            padding:16px;position:relative;overflow:hidden;margin-bottom:12px">
+                  <div style="position:absolute;top:0;left:0;right:0;height:2px;background:{cls_color}"></div>
+                  <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:4px">
+                    <div style="font-size:14px;font-weight:500;color:#e0eaf8">{v.get('name','')}</div>
+                    <span style="font-family:'DM Mono',monospace;font-size:10px;padding:2px 8px;border-radius:2px;
+                                 background:rgba(255,64,96,.1) if l['recommendation']=='TERMINATE' else rgba(255,176,32,.1);
+                                 color:{cls_color};border:1px solid {cls_color}33">{l['recommendation']}</span>
+                  </div>
+                  <div style="font-family:'DM Mono',monospace;font-size:11px;color:#6a8aaa;margin-bottom:10px">
+                    {v.get('service','N/A')}</div>
+                  <div style="margin-bottom:10px">{reasons_html}</div>
+                  <div style="display:flex;gap:12px;font-family:'DM Mono',monospace;font-size:11px;color:#4a6080">
+                    <span>Spend: Rs.{int(float(v.get('annual_spend',0) or 0)):,}</span>
+                    <span>Txn: {v.get('transactions',0)}</span>
+                    <span>Rating: {v.get('rating','N/A')}</span>
+                  </div>
+                </div>""", unsafe_allow_html=True)
 
-                    if send_reply:
-                        if not vendor_reply.strip():
-                            st.error("Please paste the vendor's reply.")
-                        else:
-                            SYS2 = """You are an elite procurement negotiation AI. Vendor has replied. Craft the strongest counter-response.
-Rules:
-- Acknowledge them professionally
-- Identify and dismantle weak excuses
-- Push firmly toward target price
-- Use any new info as additional leverage
-Return ONLY valid JSON:
-{"subject":"subject","email":"full counter-email","analysis":"what their reply reveals","new_predicted_price":"achievable price","confidence":80,"recommendation":"push more | accept | close deal"}"""
-                            USR2 = f"""Context: Vendor={deal['vendor']} | Product={deal['product']} | Quote={deal['quoted']} | Target={deal['target']}
+    # ── FULL VENDOR REGISTRY ──
+    st.markdown("""
+    <div style="display:flex;align-items:baseline;gap:12px;margin-bottom:16px;
+                padding-bottom:12px;border-bottom:1px solid #111d2e">
+      <div style="font-family:'Bebas Neue',sans-serif;font-size:22px;letter-spacing:1px">
+        FULL VENDOR REGISTRY</div>
+    </div>""", unsafe_allow_html=True)
 
-Vendor's reply:
-{vendor_reply}
+    dup_ids = {d["secondary"].get("id") or d["secondary"].get("name") for d in duplicates}
+    lv_ids  = {l["vendor"].get("id") or l["vendor"].get("name") for l in low_value}
 
-Write strongest counter-response toward {deal['target']}. Sign as {deal['myName']}."""
-                            with st.spinner("AI reading reply and crafting counter-offer..."):
-                                try:
-                                    raw = call_groq([
-                                        {"role":"system","content":SYS2},
-                                        {"role":"user","content":USR2}
-                                    ])
-                                    r = parse_json(raw)
-                                    if not r:
-                                        r = {"subject":f"Re: {deal['product']}","email":raw,
-                                             "analysis":"Vendor is open to negotiation.",
-                                             "new_predicted_price":deal["target"],
-                                             "confidence":70,"recommendation":"push more"}
-                                    deal["status"] = "negotiating"
-                                    deal["predicted"] = r.get("new_predicted_price", deal["target"])
-                                    deal["rounds"] = deal.get("rounds",0) + 1
-                                    st.session_state.handle_reply_id = None
-                                    st.session_state.result = {
-                                        "subject": r["subject"],
-                                        "email": r["email"],
-                                        "reasoning": r.get("analysis",""),
-                                        "confidence": r.get("confidence",72),
-                                        "predicted_response": f"Recommendation: {r.get('recommendation','')} — Predicted: {r.get('new_predicted_price','')}"
-                                    }
-                                    st.rerun()
-                                except Exception as e:
-                                    st.error(f"API Error: {e}")
+    table_rows = []
+    for v in vendors:
+        vid = v.get("id") or v.get("name")
+        is_dup = vid in dup_ids
+        is_lv  = vid in lv_ids
+        status = "Duplicate" if is_dup else ("Low Value" if is_lv else "Active")
+        table_rows.append({
+            "ID": v.get("id","-"),
+            "Vendor Name": v.get("name",""),
+            "Service": v.get("service","-"),
+            "Annual Spend": fmt(v.get("annual_spend",0) or 0),
+            "Transactions": v.get("transactions","-"),
+            "Rating": v.get("rating","-"),
+            "Status": status
+        })
 
-    st.markdown("</div>", unsafe_allow_html=True)
+    import pandas as pd
+    df = pd.DataFrame(table_rows)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.markdown("<div style='margin-top:24px'></div>", unsafe_allow_html=True)
+    if st.button("← NEW ANALYSIS", key="reset"):
+        st.session_state.results = None
+        st.rerun()
