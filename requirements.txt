@@ -1,0 +1,9 @@
+streamlit
+pandas
+numpy
+openai
+groq
+scikit-learn
+plotly
+python-dotenv
+langchain-groq
