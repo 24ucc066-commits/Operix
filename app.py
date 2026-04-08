@@ -801,7 +801,7 @@ with fc7:
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
     st.markdown('<div class="btn-ora">', unsafe_allow_html=True)
     if st.button("✂️  Cost Cutter", key="fc_ccb", use_container_width=True):
-        st.switch_page("pages/costcut.py")
+        st.switch_page("pages/costsense.py")
     st.markdown("</div>", unsafe_allow_html=True)
 
 
